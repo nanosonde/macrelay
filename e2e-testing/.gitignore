@@ -1,0 +1,4 @@
+# Harness-generated material, never committed.
+artifacts/*
+!artifacts/.gitkeep
+.env

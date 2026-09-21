@@ -1,0 +1,309 @@
+# MacRelay end-to-end test environment
+#
+#   fritzbox   ISP router simulation: IPv4 DHCP + NAT to the outside, RA/SLAAC
+#              for the /64 the downstream hosts keep, and a route for that /64
+#              back to the MacRelay box
+#   openwrt    a real OpenWrt x86-64 VM under QEMU TCG running macrelay.sh
+#   router     downstream gateway: IPv4 routing with NAT disabled, IPv6
+#              passthrough (it does not touch IPv6 at all)
+#   clients    one container carrying CLIENT_COUNT hosts as macvlans, so every
+#              host reaches MacRelay with its own MAC and its own address
+#
+# The OpenWrt guest is not a container process: it boots OpenWrt's own
+# kernel, so macvlan, nftables, policy routing and conntrack behave exactly
+# as they do on real hardware.
+#
+#   internet (docker NAT)
+#        |
+#   .----+-----.  isp 192.168.178.0/24 / 2001:db8:f412::/64
+#   | fritzbox |----------------------------------.
+#   '----------'  192.168.178.1                   |
+#                                           .-----+------.
+#                                           | openwrt VM |  eth0 192.168.178.2
+#                                           |  macrelay  |  eth1 10.10.30.2
+#                                           '-----+------'  eth2 198.18.1.50
+#                                                 |
+#                     downstream LAN 10.10.30.0/24 + 2001:db8:f412::/64
+#                                                 |
+#                    router  10.10.30.1 (LAN) + 10.10.30.5 (WAN, one NIC)
+#                                                 |
+#                    clients 10.10.30.11 - 10.10.30.110, one macvlan each
+#
+# Both families cross the downstream LAN as one segment. IPv4 is routed by
+# the gateway (its WAN address comes back for its own default route:
+# router-on-a-stick) and its clients arrive at MacRelay as a source address.
+# IPv6 is passthrough: the hosts keep the ISP /64, the gateway neither routes
+# nor translates it, and their own MACs and GUAs reach MacRelay directly.
+
+name: macrelay-e2e
+
+services:
+  fritzbox:
+    build:
+      context: ./fritzbox
+    image: macrelay-e2e-fritzbox:latest
+    container_name: macrelay-e2e-fritzbox
+    hostname: fritz.box
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.forwarding: "1"
+      net.ipv6.conf.all.forwarding: "1"
+      net.ipv6.conf.all.disable_ipv6: "0"
+    environment:
+      LAN_ADDRESS4: ${E2E_FRITZ_IP4:-192.168.178.1}
+      LAN_PREFIX4: ${E2E_ISP_SUBNET4:-192.168.178.0/24}
+      LAN_ADDRESS6: ${E2E_FRITZ_IP6:-2001:db8:f412::1}
+      # Kept clear of .11-.110, which the 1:1 mapping needs for the clients.
+      DHCP_START: ${E2E_ISP_DHCP_START:-192.168.178.200}
+      DHCP_END: ${E2E_ISP_DHCP_END:-192.168.178.239}
+      DHCP_NETMASK: ${E2E_ISP_NETMASK:-255.255.255.0}
+      DHCP_LEASE_TIME: ${E2E_ISP_LEASE_TIME:-12h}
+      # The hosts keep addresses from the ISP /64, so from this box they are
+      # ordinary LAN devices and MacRelay answers NDP for them. Nothing has
+      # to be routed back into the lab for IPv6 at all.
+      # The downstream router does not NAT, so its clients arrive with their
+      # own source addresses. The return path is the 1:1 mapped address
+      # MacRelay gives the router's WAN port, so if MacRelay is not running
+      # that next hop does not exist and downstream IPv4 goes dark.
+      RELAY_SUBNET4: ${E2E_LAN_SUBNET:-10.10.10.0/24}
+      TRANSIT_VIA4: ${E2E_OPENWRT_WAN_IP4:-192.168.178.2}
+      # Fake "internet" endpoints hosted on a dummy interface.
+      INTERNET_IP4: ${E2E_INTERNET_IP4:-198.51.100.1}
+      INTERNET_IP6: ${E2E_INTERNET_IP6:-2001:db8:ffff::1}
+      UPLINK_NAT: ${E2E_FRITZ_UPLINK_NAT:-1}
+      # Set when Docker's embedded resolver cannot reach a working upstream,
+      # e.g. because the host's own resolver sits inside a lab subnet.
+      UPSTREAM_DNS: ${E2E_UPSTREAM_DNS:-}
+    networks:
+      isp:
+        ipv4_address: ${E2E_FRITZ_IP4:-192.168.178.1}
+        ipv6_address: ${E2E_FRITZ_IP6:-2001:db8:f412::1}
+    healthcheck:
+      test: ["CMD", "pgrep", "-x", "dnsmasq"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  openwrt:
+    build:
+      context: ./openwrt
+    image: macrelay-e2e-openwrt:latest
+    container_name: macrelay-e2e-openwrt
+    hostname: macrelay-vm
+    restart: unless-stopped
+    # Loop-mounting the guest disk and rebuilding the container's own
+    # interfaces into bridges needs more than the default privileges.
+    # QEMU uses software TCG, so /dev/kvm is deliberately not required.
+    privileged: true
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      OPENWRT_VERSION: ${E2E_OPENWRT_VERSION:-25.12.5}
+      # container-side addresses, moved onto the guest bridges at startup
+      ISP_CONTAINER_IP: ${E2E_OPENWRT_ISP_CONTAINER_IP:-192.168.178.4}
+      LAN_CONTAINER_IP: ${E2E_OPENWRT_LAN_CONTAINER_IP:-10.10.30.4}
+      CONTROL_CONTAINER_IP: ${E2E_OPENWRT_CONTROL_CONTAINER_IP:-198.18.1.20}
+      CONTROL_GATEWAY: ${E2E_CONTROL_GATEWAY:-198.18.1.1}
+      # guest-side addresses, written into the disk image on first boot
+      VM_WAN_IP4: ${E2E_OPENWRT_WAN_IP4:-192.168.178.2}
+      VM_WAN_GW4: ${E2E_FRITZ_IP4:-192.168.178.1}
+      VM_WAN_IP6: ${E2E_OPENWRT_WAN_IP6:-2001:db8:f412::2}
+      VM_WAN_GW6: ${E2E_FRITZ_IP6:-2001:db8:f412::1}
+      # MacRelay's INT_IF: the downstream LAN itself, where the hosts are
+      # layer-2 adjacent. The /64 is the ISP router's own, since the hosts
+      # keep it in passthrough mode.
+      VM_LAN_IP4: ${E2E_OPENWRT_LAN_IP:-10.10.30.2}
+      VM_LAN_IP6: ${E2E_OPENWRT_LAN_IP6:-2001:db8:f412::a}
+      VM_LAN_PREFIX6: ${E2E_ISP_SUBNET6:-2001:db8:f412::/64}
+      VM_CONTROL_IP: ${E2E_CONTROL_IP:-198.18.1.50}
+      # IPv4 is routed by the downstream gateway and only its source
+      # addresses are visible; IPv6 is passthrough and keeps MAC identity.
+      MACRELAY_INT_PREFIX4: ${E2E_MACRELAY_INT_PREFIX4:-10.10.10}
+      # Octets 1/2/4/5 are the router, the guest's own LAN port, the openwrt
+      # container and the router's WAN; 10 is the client simulator itself.
+      MACRELAY_RESERVED_OCTETS: ${E2E_MACRELAY_RESERVED_OCTETS:-0 1 2 4 5 10 254 255}
+      MACRELAY_INT_PREFIX6: ${E2E_MACRELAY_INT_PREFIX6:-2001:db8:f412:}
+      MACRELAY_PROXY_NDP: ${E2E_MACRELAY_PROXY_NDP:-1}
+      MACRELAY_PROVISION_IPV6: ${E2E_MACRELAY_PROVISION_IPV6:-1}
+      MACRELAY_UNIFY_MAC: ${E2E_MACRELAY_UNIFY_MAC:-1}
+      VM_MAC_WAN: ${E2E_VM_MAC_WAN:-52:54:00:12:34:56}
+      VM_MAC_LAN: ${E2E_VM_MAC_LAN:-52:54:00:12:34:57}
+      VM_MAC_CONTROL: ${E2E_VM_MAC_CONTROL:-52:54:00:12:34:58}
+      VM_MEMORY: ${E2E_VM_MEMORY:-512}
+      VM_CPUS: ${E2E_VM_CPUS:-2}
+    networks:
+      isp:
+        ipv4_address: ${E2E_OPENWRT_ISP_CONTAINER_IP:-192.168.178.4}
+        # Pinned, or Docker hands out ::2, which is the guest's WAN address.
+        ipv6_address: ${E2E_OPENWRT_ISP_CONTAINER_IP6:-2001:db8:f412::4}
+      lan:
+        ipv4_address: ${E2E_OPENWRT_LAN_CONTAINER_IP:-10.10.30.4}
+      control:
+        ipv4_address: ${E2E_OPENWRT_CONTROL_CONTAINER_IP:-198.18.1.20}
+    ports:
+      # Guest serial console: `just e2e-console`
+      - "${E2E_CONSOLE_PORT:-2323}:2323/tcp"
+    volumes:
+      - openwrt-data:/data
+      - ./artifacts:/artifacts:ro
+    healthcheck:
+      test: ["CMD-SHELL", "ping -c1 -W1 ${E2E_CONTROL_IP:-198.18.1.50} >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 120s
+    depends_on:
+      fritzbox:
+        condition: service_started
+
+  # ---- downstream gateway ----------------------------------------------
+  # Router-on-a-stick: one NIC on the downstream LAN carries both its WAN
+  # address (its IPv4 default route points back at the MacRelay box) and the
+  # LAN address its clients use as their gateway. IPv6 is passthrough, so it
+  # neither routes nor advertises it: the hosts' frames cross it untouched.
+  router:
+    build:
+      context: ./router
+    image: macrelay-e2e-router:latest
+    container_name: macrelay-e2e-router
+    hostname: downstream-router
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    # /proc/sys is read-only unless the container is privileged, so these
+    # have to be applied by the runtime rather than by the entrypoint.
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv4.conf.all.forwarding: "1"
+      # IPv6 is not handled here at all in passthrough mode.
+      net.ipv6.conf.all.forwarding: "0"
+      net.ipv6.conf.all.accept_ra: "0"
+    environment:
+      WAN_ADDRESS4: ${E2E_ROUTER_WAN_IP:-10.10.10.5}
+      WAN_GATEWAY4: ${E2E_OPENWRT_LAN_IP:-10.10.30.2}
+      LAN_ADDRESS4: ${E2E_ROUTER_LAN_IP:-10.10.10.1}
+      LAN_SUBNET4: ${E2E_LAN_SUBNET:-10.10.10.0/24}
+      # Passthrough: the hosts keep the ISP /64 and the gateway leaves IPv6
+      # alone. Set to 0 for the legacy routed/PD mode (see the README).
+      IPV6_PASSTHROUGH: ${E2E_ROUTER_IPV6_PASSTHROUGH:-1}
+      # NAT stays off: this is the "gateway with NAT disabled" MacRelay sits
+      # in front of. Flip to 1 only to compare against the double-NAT case.
+      IPV4_NAT: ${E2E_ROUTER_IPV4_NAT:-0}
+    networks:
+      lan:
+        ipv4_address: ${E2E_ROUTER_WAN_IP:-10.10.10.5}
+    healthcheck:
+      test: ["CMD-SHELL", "ip -4 route show default >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      openwrt:
+        condition: service_healthy
+
+  # ---- downstream hosts ------------------------------------------------
+  # One container stands in for CLIENT_COUNT hosts. Each host is a macvlan
+  # with its own MAC and its own IPv4 + IPv6 address, so the FRITZ!Box ends
+  # up seeing CLIENT_COUNT distinct devices - which is the whole point of the
+  # proxy NDP path, and impossible to reproduce with one shared MAC.
+  clients:
+    build:
+      context: ./client
+    image: macrelay-e2e-client:latest
+    container_name: macrelay-e2e-clients
+    hostname: clients
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    sysctls:
+      net.ipv6.conf.all.accept_ra: "1"
+      net.ipv6.conf.all.autoconf: "1"
+    environment:
+      GATEWAY4: ${E2E_ROUTER_LAN_IP:-10.10.10.1}
+      # The MacRelay box: the hosts keep the ISP /64, but the ISP router is
+      # a hop away, so every IPv6 packet leaves through MacRelay - both the
+      # ones for the internet and the ones the ISP router has to resolve by
+      # proxy NDP.
+      GATEWAY6: ${E2E_OPENWRT_LAN_IP6:-2001:db8:f412::a}
+      DNS: ${E2E_FRITZ_IP4:-192.168.178.1}
+      CLIENT_COUNT: ${E2E_CLIENT_COUNT:-100}
+      CLIENT_FIRST: ${E2E_CLIENT_FIRST:-10.10.10.11}
+      # The ISP /64 the hosts take their addresses from, with the host octet
+      # in hex so one host's IPv4 and IPv6 identify each other (MacRelay's
+      # gua_v4 reads the last hextet).
+      HOST_PREFIX6: ${E2E_ISP_SUBNET6_PREFIX:-2001:db8:f412}
+      # DNS from the ISP router over IPv6, the address shared-prefix hosts
+      # can actually reach.
+      DNS6: ${E2E_FRITZ_IP6:-2001:db8:f412::1}
+      MAC_BASE: ${E2E_CLIENT_MAC_BASE:-52:54:11:00:00:00}
+    networks:
+      lan:
+        ipv4_address: ${E2E_CLIENTS_CONTAINER_IP:-10.10.10.10}
+    depends_on:
+      router:
+        condition: service_started
+
+networks:
+  # The ISP LAN. Not internal, so the simulated FRITZ!Box has a real uplink
+  # and `apk add` inside the guest works.
+  isp:
+    name: macrelay-e2e-isp
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        # Static addresses are assigned above; the dynamic pool sits at the
+        # top of the range so the 1:1 mapped host octets stay free.
+        - subnet: ${E2E_ISP_SUBNET4:-192.168.178.0/24}
+          gateway: ${E2E_ISP_DOCKER_GATEWAY:-192.168.178.254}
+          ip_range: ${E2E_ISP_DOCKER_POOL:-192.168.178.240/28}
+        - subnet: ${E2E_ISP_SUBNET6:-2001:db8:f412::/64}
+          gateway: ${E2E_ISP_DOCKER_GATEWAY6:-2001:db8:f412::fffe}
+    driver_opts:
+      com.docker.network.bridge.name: mr-e2e-isp
+
+  # The downstream LAN: the router's LAN and WAN, the guest's INT_IF and the
+  # hosts, all on one segment. This is the only place MacRelay is layer-2
+  # adjacent to a host, so it is where MAC identity and the hosts' GUAs come
+  # from; their IPv4 is routed through the gateway on the same segment.
+  #
+  # Not `internal`: Docker implements that with a
+  # `! -d <subnet> -i <bridge> -j DROP` rule, which would discard every
+  # packet this lab routes through the segment.
+  lan:
+    name: macrelay-e2e-lan
+    driver: bridge
+    enable_ipv6: true
+    ipam:
+      config:
+        - subnet: ${E2E_LAN_SUBNET:-10.10.10.0/24}
+          gateway: ${E2E_LAN_DOCKER_GATEWAY:-10.10.10.254}
+          ip_range: ${E2E_LAN_DOCKER_POOL:-10.10.10.240/28}
+        - subnet: ${E2E_LAN_ULA6:-fd00:e2e:10::/64}
+          gateway: ${E2E_LAN_DOCKER_GATEWAY6:-fd00:e2e:10::fffe}
+    driver_opts:
+      com.docker.network.bridge.name: mr-e2e-lan
+
+  # Harness-only path to the guest; a broken WAN or downstream link cannot
+  # lock us out of the VM.
+  control:
+    name: macrelay-e2e-control
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${E2E_CONTROL_SUBNET:-198.18.1.0/24}
+          gateway: ${E2E_CONTROL_GATEWAY:-198.18.1.1}
+          ip_range: ${E2E_CONTROL_DOCKER_POOL:-198.18.1.224/27}
+    driver_opts:
+      com.docker.network.bridge.name: mr-e2e-ctl
+
+volumes:
+  openwrt-data:
